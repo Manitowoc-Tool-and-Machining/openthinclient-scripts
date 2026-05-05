@@ -14,6 +14,7 @@
 #   sudo ./install-printer.sh --list                # list detected USB printers and exit
 #   sudo ./install-printer.sh --uninstall <name>    # remove a queue
 #   sudo ./install-printer.sh --force               # ignore early-exit guard, reinstall
+#   sudo ./install-printer.sh --allow-generic-ppd   # accept generic-fallback PPD instead of failing
 #
 # Exit codes:
 #   0  success (or already installed and --force not set)
@@ -21,17 +22,16 @@
 #   2  no USB printer detected
 #   3  unsupported / unknown vendor
 #   4  driver install failed
-#   5  PPD not found
+#   5  PPD not found (or only generic fallback available; pass --allow-generic-ppd to accept)
 #   6  must be run as root
 #
 set -euo pipefail
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 
 # ---------- Config ----------
 LOG_FILE="/var/log/install-printer.log"
 EPSON_DEB_URL="https://download3.ebz.epson.net/dsc/f/03/00/16/90/96/951574ae91f5cdc717c8bdce53b1fac5d2dc8a0a/epson-inkjet-printer-escpr2_1.2.31-1_amd64.deb"
-EPSON_PPD_FALLBACK="/opt/epson-inkjet-printer-escpr2/ppds/Epson/Epson-ST-M1000_Series-epson-inkjet-printer-escpr2.ppd.gz"
 TMP_DIR="$(mktemp -d -t printer-install-XXXXXX)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -46,6 +46,7 @@ LIST_ONLY=0
 UNINSTALL=""
 SET_DEFAULT=1
 FORCE=0
+ALLOW_GENERIC=0
 
 # ---------- Helpers ----------
 log() {
@@ -68,7 +69,7 @@ require_root() {
 }
 
 usage() {
-    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -81,14 +82,15 @@ urldecode() {
 # ---------- Argument parsing ----------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --vendor)    VENDOR="${2,,}"; shift 2 ;;
-        --model)     MODEL="$2"; shift 2 ;;
-        --name)      QUEUE_NAME="$2"; shift 2 ;;
-        --list)      LIST_ONLY=1; shift ;;
-        --uninstall) UNINSTALL="$2"; shift 2 ;;
-        --no-default) SET_DEFAULT=0; shift ;;
-        --force)     FORCE=1; shift ;;
-        -h|--help)   usage ;;
+        --vendor)             VENDOR="${2,,}"; shift 2 ;;
+        --model)              MODEL="$2"; shift 2 ;;
+        --name)               QUEUE_NAME="$2"; shift 2 ;;
+        --list)               LIST_ONLY=1; shift ;;
+        --uninstall)          UNINSTALL="$2"; shift 2 ;;
+        --no-default)         SET_DEFAULT=0; shift ;;
+        --force)              FORCE=1; shift ;;
+        --allow-generic-ppd)  ALLOW_GENERIC=1; shift ;;
+        -h|--help)            usage ;;
         *) die "Unknown argument: $1" 1 ;;
     esac
 done
@@ -152,15 +154,13 @@ ensure_base_packages() {
 # model in a reliable, parseable form (e.g. usb://EPSON/ST-M1000%20Series?serial=...),
 # so we use that as the source of truth rather than trying to query lpinfo for it.
 #
-# Returns lines: "VENDOR_KEY|DEVICE_URI|MAKE_MODEL"
+# Returns lines: "VENDOR_KEY|DEVICE_URI|RAW_VENDOR|RAW_MODEL"
+# (RAW_VENDOR/RAW_MODEL are URL-decoded; downstream code uses them directly.)
 detect_usb_printers() {
     while IFS= read -r line; do
-        # lpinfo -v output format: "<class> <uri>" e.g. "direct usb://EPSON/ST-M1000%20Series?..."
         [[ "$line" =~ ^direct[[:space:]]+(usb://.+)$ ]] || continue
         local uri="${BASH_REMATCH[1]}"
 
-        # Extract vendor (host part) and model (path part) directly from the URI
-        # usb://VENDOR/MODEL?query  →  vendor=VENDOR, model=MODEL
         local raw_vendor="" raw_model=""
         if [[ "$uri" =~ ^usb://([^/]+)/([^?]+) ]]; then
             raw_vendor="${BASH_REMATCH[1]}"
@@ -169,11 +169,9 @@ detect_usb_printers() {
             continue
         fi
 
-        # URL-decode (handle %20 → space, etc.)
         raw_vendor="$(urldecode "$raw_vendor")"
         raw_model="$(urldecode "$raw_model")"
 
-        local mm="${raw_vendor} ${raw_model}"
         local key="unknown"
         case "${raw_vendor,,}" in
             *epson*)              key="epson" ;;
@@ -183,8 +181,6 @@ detect_usb_printers() {
             *lexmark*)            key="lexmark" ;;
         esac
 
-        # Fallback: some printers report a generic vendor in the URI host but the
-        # brand name appears in the model. Sniff the model too if we got nothing.
         if [[ "$key" == "unknown" ]]; then
             case "${raw_model,,}" in
                 *epson*)                                                 key="epson" ;;
@@ -195,17 +191,17 @@ detect_usb_printers() {
             esac
         fi
 
-        echo "${key}|${uri}|${mm}"
+        echo "${key}|${uri}|${raw_vendor}|${raw_model}"
     done < <(lpinfo -v 2>/dev/null)
 }
 
 list_printers() {
     info "Scanning for USB printers..."
     local found=0
-    while IFS='|' read -r key uri mm; do
+    while IFS='|' read -r key uri rv rm; do
         [[ -z "$uri" ]] && continue
         found=1
-        echo "  [$key] $mm"
+        echo "  [$key] ${rv} ${rm}"
         echo "         URI: $uri"
     done < <(detect_usb_printers)
     if [[ $found -eq 0 ]]; then
@@ -257,56 +253,91 @@ install_brother_driver() {
 }
 
 # ---------- PPD resolution ----------
-# Picks the closest matching PPD for the detected vendor/model from the
-# installed PPD database (lpinfo -m). Falls back to known-good defaults.
+# Build candidate model tokens from a model string like "ST-M1000 Series" and
+# try each one against the installed PPD database, preferring more-specific
+# matches. Returns the first PPD that matches a real model token.
+#
+# Output to stdout: "<ppd>|<match_quality>"
+#   match_quality: "exact"  — matched a model-specific PPD
+#                  "generic" — only a generic vendor PPD found (caller decides)
+#                  ""        — nothing usable
 resolve_ppd() {
     local vendor="$1"
-    local mm="$2"
-    local ppd=""
+    local raw_model="$2"
 
-    # Pull a model token from the make/model string for fuzzy matching.
-    # Examples: "EPSON ST-M1000 Series" → "ST-M1000"
-    #           "Brother HL-L2350DW"    → "HL-L2350DW"
-    local model_token=""
-    model_token="$(echo "$mm" | grep -oE '[A-Z]+-?[A-Z0-9]+([_-][A-Z0-9]+)*' | head -n1 || true)"
+    # Build a list of token candidates from the model string, ordered most-specific first.
+    # Examples:
+    #   "ST-M1000 Series" → ["ST-M1000", "M1000", "ST-M1000 Series", "ST"]
+    #   "HL-L2350DW"      → ["HL-L2350DW", "L2350DW", "HL-L2350"]
+    #   "OfficeJet Pro 8025" → ["OfficeJet Pro 8025", "8025", "OfficeJet"]
+    local -a tokens=()
 
+    # The whole trimmed model, with "Series" stripped (CUPS PPDs sometimes don't include it)
+    local trimmed="${raw_model%% Series}"
+    trimmed="${trimmed% Series}"
+    [[ -n "$trimmed" ]] && tokens+=("$trimmed")
+    [[ "$trimmed" != "$raw_model" && -n "$raw_model" ]] && tokens+=("$raw_model")
+
+    # Hyphenated model identifier (the most distinctive token in most cases): ST-M1000, HL-L2350DW
+    local hyphenated
+    hyphenated="$(echo "$raw_model" | grep -oE '[A-Z]+-[A-Z0-9]+' | head -n1 || true)"
+    [[ -n "$hyphenated" ]] && tokens+=("$hyphenated")
+
+    # Numeric-suffix part: M1000, L2350DW, 8025
+    local numeric
+    numeric="$(echo "$raw_model" | grep -oE '[A-Z]*[0-9]{3,}[A-Z]*' | head -n1 || true)"
+    [[ -n "$numeric" ]] && tokens+=("$numeric")
+
+    info "PPD candidate tokens: ${tokens[*]:-<none>}"
+
+    # Vendor-specific search filters
+    local vendor_grep="" preferred_driver=""
     case "$vendor" in
-        epson)
-            # Try matching the specific model first
-            if [[ -n "$model_token" ]]; then
-                ppd="$(lpinfo -m 2>/dev/null | grep -i "epson" | grep -i "$model_token" | grep -i "escpr2" | awk '{print $1}' | head -n1)"
-                [[ -z "$ppd" ]] && ppd="$(lpinfo -m 2>/dev/null | grep -i "epson" | grep -i "$model_token" | awk '{print $1}' | head -n1)"
+        epson)   vendor_grep="epson";   preferred_driver="escpr2" ;;
+        hp)      vendor_grep="hpcups";  preferred_driver="" ;;
+        brother) vendor_grep="brother"; preferred_driver="brlaser" ;;
+        *)       vendor_grep="$vendor"; preferred_driver="" ;;
+    esac
+
+    local all_ppds
+    all_ppds="$(lpinfo -m 2>/dev/null || true)"
+
+    # Try each token against (vendor + preferred driver) first, then (vendor only)
+    local token ppd
+    for token in "${tokens[@]}"; do
+        if [[ -n "$preferred_driver" ]]; then
+            ppd="$(echo "$all_ppds" | grep -i "$vendor_grep" | grep -i "$preferred_driver" \
+                   | grep -iF -- "$token" | awk '{print $1}' | head -n1 || true)"
+            if [[ -n "$ppd" ]]; then
+                echo "${ppd}|exact"
+                return 0
             fi
-            # Generic Epson escpr2 match
-            [[ -z "$ppd" ]] && ppd="$(lpinfo -m 2>/dev/null | grep -i "epson" | grep -i "escpr2" | awk '{print $1}' | head -n1)"
-            [[ -z "$ppd" ]] && ppd="$(lpinfo -m 2>/dev/null | grep -i "epson" | awk '{print $1}' | head -n1)"
-            # Last-resort: hardcoded fallback PPD installed by the vendor .deb
-            if [[ -z "$ppd" && -f "$EPSON_PPD_FALLBACK" ]]; then
-                ppd="$EPSON_PPD_FALLBACK"
-            fi
-            ;;
+        fi
+        ppd="$(echo "$all_ppds" | grep -i "$vendor_grep" \
+               | grep -iF -- "$token" | awk '{print $1}' | head -n1 || true)"
+        if [[ -n "$ppd" ]]; then
+            echo "${ppd}|exact"
+            return 0
+        fi
+    done
+
+    # No specific match. Don't silently grab a random vendor PPD — that's how
+    # an ST-M1000 ends up on the EC-4020 driver and prints blank pages.
+    # Return the most-likely-to-work generic fallback and let the caller decide.
+    case "$vendor" in
         hp)
-            if [[ -n "$model_token" ]]; then
-                ppd="$(lpinfo -m 2>/dev/null | grep -i "hpcups" | grep -i "$model_token" | awk '{print $1}' | head -n1)"
-            fi
-            [[ -z "$ppd" ]] && ppd="$(lpinfo -m 2>/dev/null | grep -i "hpcups" | awk '{print $1}' | head -n1)"
-            [[ -z "$ppd" ]] && ppd="drv:///hp/hpcups.drv/hp-deskjet.ppd"
+            ppd="drv:///hp/hpcups.drv/hp-deskjet.ppd"
             ;;
         brother)
-            local brother_token="${MODEL:-$model_token}"
-            if [[ -n "$brother_token" ]]; then
-                ppd="$(lpinfo -m 2>/dev/null | grep -i "brlaser" | grep -i "$brother_token" | awk '{print $1}' | head -n1)"
-                [[ -z "$ppd" ]] && ppd="$(lpinfo -m 2>/dev/null | grep -i "brother" | grep -i "$brother_token" | awk '{print $1}' | head -n1)"
-            fi
-            [[ -z "$ppd" ]] && ppd="$(lpinfo -m 2>/dev/null | grep -i "brlaser" | awk '{print $1}' | head -n1)"
-            [[ -z "$ppd" ]] && ppd="$(lpinfo -m 2>/dev/null | grep -i "brother" | awk '{print $1}' | head -n1)"
+            ppd="$(echo "$all_ppds" | grep -i "brlaser" | awk '{print $1}' | head -n1 || true)"
             [[ -z "$ppd" ]] && ppd="drv:///sample.drv/generic.ppd"
             ;;
         *)
             ppd="drv:///sample.drv/generic.ppd"
             ;;
     esac
-    echo "$ppd"
+    echo "${ppd}|generic"
+    return 0
 }
 
 # ---------- Queue creation ----------
@@ -370,8 +401,8 @@ else
     VENDOR="${SELECTED%%|*}"
 fi
 
-IFS='|' read -r DETECTED_VENDOR PRINTER_URI PRINTER_MM <<<"$SELECTED"
-info "Selected printer: vendor='$DETECTED_VENDOR' model='$PRINTER_MM'"
+IFS='|' read -r DETECTED_VENDOR PRINTER_URI RAW_VENDOR RAW_MODEL <<<"$SELECTED"
+info "Selected printer: vendor='$DETECTED_VENDOR' make='$RAW_VENDOR' model='$RAW_MODEL'"
 info "                  URI: $PRINTER_URI"
 
 if [[ -z "$QUEUE_NAME" ]]; then
@@ -391,11 +422,33 @@ case "$DETECTED_VENDOR" in
     *)       die "Detected vendor '$DETECTED_VENDOR' is not supported by this script. Pass --vendor to override." 3 ;;
 esac
 
-PPD="$(resolve_ppd "$DETECTED_VENDOR" "$PRINTER_MM")"
+PPD_RESULT="$(resolve_ppd "$DETECTED_VENDOR" "$RAW_MODEL")"
+PPD="${PPD_RESULT%|*}"
+PPD_QUALITY="${PPD_RESULT##*|}"
+
 if [[ -z "$PPD" ]]; then
-    die "Could not resolve a PPD for $DETECTED_VENDOR / $PRINTER_MM." 5
+    die "Could not resolve a PPD for $DETECTED_VENDOR / $RAW_MODEL." 5
 fi
-info "Using PPD: $PPD"
+
+if [[ "$PPD_QUALITY" == "generic" ]]; then
+    if [[ "$ALLOW_GENERIC" -eq 1 ]]; then
+        warn "No model-specific PPD found for '$RAW_MODEL'. Falling back to generic: $PPD"
+        warn "Output quality may be reduced; printer may produce blank pages on incompatible models."
+    else
+        err "No model-specific PPD found for '$RAW_MODEL'."
+        err "Refusing to install with a generic PPD because that often results in blank pages."
+        err "Available ${DETECTED_VENDOR} PPDs (for reference):"
+        lpinfo -m 2>/dev/null | grep -i "$DETECTED_VENDOR" | head -n 30 | while IFS= read -r ln; do
+            err "  $ln"
+        done
+        err "Options:"
+        err "  1) Install the vendor's model-specific PPD/driver and re-run."
+        err "  2) Re-run with --allow-generic-ppd to accept the generic fallback anyway."
+        exit 5
+    fi
+fi
+
+info "Using PPD: $PPD (match: $PPD_QUALITY)"
 
 add_queue "$QUEUE_NAME" "$PRINTER_URI" "$PPD"
 
