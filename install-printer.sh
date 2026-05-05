@@ -26,7 +26,7 @@
 #
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 # ---------- Config ----------
 LOG_FILE="/var/log/install-printer.log"
@@ -70,6 +70,12 @@ require_root() {
 usage() {
     sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
+}
+
+# URL-decode a string (for %20 etc. in USB URIs)
+urldecode() {
+    local s="${1//+/ }"
+    printf '%b' "${s//%/\\x}"
 }
 
 # ---------- Argument parsing ----------
@@ -142,31 +148,55 @@ ensure_base_packages() {
 }
 
 # ---------- USB printer detection ----------
+# Parses USB device URIs from `lpinfo -v`. The URI itself contains the make and
+# model in a reliable, parseable form (e.g. usb://EPSON/ST-M1000%20Series?serial=...),
+# so we use that as the source of truth rather than trying to query lpinfo for it.
+#
 # Returns lines: "VENDOR_KEY|DEVICE_URI|MAKE_MODEL"
 detect_usb_printers() {
-    lpinfo -v 2>/dev/null | awk '
-        /^direct usb:/ {
-            uri=$2
-            line=$0
-            sub(/^direct /, "", line)
-            print line
-        }' | while read -r uri; do
-        local mm=""
-        mm="$(lpinfo --make-and-model -v "$uri" 2>/dev/null | head -n1 || true)"
-        if [[ -z "$mm" ]]; then
-            mm="$(echo "$uri" | sed -E 's#usb://([^/]+)/([^?]+).*#\1 \2#; s/%20/ /g')"
+    while IFS= read -r line; do
+        # lpinfo -v output format: "<class> <uri>" e.g. "direct usb://EPSON/ST-M1000%20Series?..."
+        [[ "$line" =~ ^direct[[:space:]]+(usb://.+)$ ]] || continue
+        local uri="${BASH_REMATCH[1]}"
+
+        # Extract vendor (host part) and model (path part) directly from the URI
+        # usb://VENDOR/MODEL?query  →  vendor=VENDOR, model=MODEL
+        local raw_vendor="" raw_model=""
+        if [[ "$uri" =~ ^usb://([^/]+)/([^?]+) ]]; then
+            raw_vendor="${BASH_REMATCH[1]}"
+            raw_model="${BASH_REMATCH[2]}"
+        else
+            continue
         fi
 
+        # URL-decode (handle %20 → space, etc.)
+        raw_vendor="$(urldecode "$raw_vendor")"
+        raw_model="$(urldecode "$raw_model")"
+
+        local mm="${raw_vendor} ${raw_model}"
         local key="unknown"
-        case "${mm,,}" in
-            *epson*)     key="epson" ;;
-            *hewlett*|*hp\ *|*hp-*|*hp_*|*officejet*|*deskjet*|*laserjet*) key="hp" ;;
-            *brother*)   key="brother" ;;
-            *canon*)     key="canon" ;;
-            *lexmark*)   key="lexmark" ;;
+        case "${raw_vendor,,}" in
+            *epson*)              key="epson" ;;
+            *hewlett*|*"hp"*)     key="hp" ;;
+            *brother*)            key="brother" ;;
+            *canon*)              key="canon" ;;
+            *lexmark*)            key="lexmark" ;;
         esac
+
+        # Fallback: some printers report a generic vendor in the URI host but the
+        # brand name appears in the model. Sniff the model too if we got nothing.
+        if [[ "$key" == "unknown" ]]; then
+            case "${raw_model,,}" in
+                *epson*)                                                 key="epson" ;;
+                *officejet*|*deskjet*|*laserjet*|*envy*|*photosmart*)    key="hp" ;;
+                *brother*)                                               key="brother" ;;
+                *canon*|*pixma*|*imageclass*)                            key="canon" ;;
+                *lexmark*)                                               key="lexmark" ;;
+            esac
+        fi
+
         echo "${key}|${uri}|${mm}"
-    done
+    done < <(lpinfo -v 2>/dev/null)
 }
 
 list_printers() {
@@ -227,25 +257,48 @@ install_brother_driver() {
 }
 
 # ---------- PPD resolution ----------
+# Picks the closest matching PPD for the detected vendor/model from the
+# installed PPD database (lpinfo -m). Falls back to known-good defaults.
 resolve_ppd() {
     local vendor="$1"
     local mm="$2"
     local ppd=""
 
+    # Pull a model token from the make/model string for fuzzy matching.
+    # Examples: "EPSON ST-M1000 Series" → "ST-M1000"
+    #           "Brother HL-L2350DW"    → "HL-L2350DW"
+    local model_token=""
+    model_token="$(echo "$mm" | grep -oE '[A-Z]+-?[A-Z0-9]+([_-][A-Z0-9]+)*' | head -n1 || true)"
+
     case "$vendor" in
         epson)
-            ppd="$(lpinfo -m 2>/dev/null | grep -i "epson" | grep -i "escpr2" | awk '{print $1}' | head -n1)"
+            # Try matching the specific model first
+            if [[ -n "$model_token" ]]; then
+                ppd="$(lpinfo -m 2>/dev/null | grep -i "epson" | grep -i "$model_token" | grep -i "escpr2" | awk '{print $1}' | head -n1)"
+                [[ -z "$ppd" ]] && ppd="$(lpinfo -m 2>/dev/null | grep -i "epson" | grep -i "$model_token" | awk '{print $1}' | head -n1)"
+            fi
+            # Generic Epson escpr2 match
+            [[ -z "$ppd" ]] && ppd="$(lpinfo -m 2>/dev/null | grep -i "epson" | grep -i "escpr2" | awk '{print $1}' | head -n1)"
             [[ -z "$ppd" ]] && ppd="$(lpinfo -m 2>/dev/null | grep -i "epson" | awk '{print $1}' | head -n1)"
+            # Last-resort: hardcoded fallback PPD installed by the vendor .deb
             if [[ -z "$ppd" && -f "$EPSON_PPD_FALLBACK" ]]; then
                 ppd="$EPSON_PPD_FALLBACK"
             fi
             ;;
         hp)
-            ppd="$(lpinfo -m 2>/dev/null | grep -i "hpcups" | awk '{print $1}' | head -n1)"
+            if [[ -n "$model_token" ]]; then
+                ppd="$(lpinfo -m 2>/dev/null | grep -i "hpcups" | grep -i "$model_token" | awk '{print $1}' | head -n1)"
+            fi
+            [[ -z "$ppd" ]] && ppd="$(lpinfo -m 2>/dev/null | grep -i "hpcups" | awk '{print $1}' | head -n1)"
             [[ -z "$ppd" ]] && ppd="drv:///hp/hpcups.drv/hp-deskjet.ppd"
             ;;
         brother)
-            ppd="$(lpinfo -m 2>/dev/null | grep -i "brlaser" | grep -i "${MODEL:-brother}" | awk '{print $1}' | head -n1)"
+            local brother_token="${MODEL:-$model_token}"
+            if [[ -n "$brother_token" ]]; then
+                ppd="$(lpinfo -m 2>/dev/null | grep -i "brlaser" | grep -i "$brother_token" | awk '{print $1}' | head -n1)"
+                [[ -z "$ppd" ]] && ppd="$(lpinfo -m 2>/dev/null | grep -i "brother" | grep -i "$brother_token" | awk '{print $1}' | head -n1)"
+            fi
+            [[ -z "$ppd" ]] && ppd="$(lpinfo -m 2>/dev/null | grep -i "brlaser" | awk '{print $1}' | head -n1)"
             [[ -z "$ppd" ]] && ppd="$(lpinfo -m 2>/dev/null | grep -i "brother" | awk '{print $1}' | head -n1)"
             [[ -z "$ppd" ]] && ppd="drv:///sample.drv/generic.ppd"
             ;;
