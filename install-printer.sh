@@ -25,9 +25,22 @@
 #   5  PPD not found (or only generic fallback available; pass --allow-generic-ppd to accept)
 #   6  must be run as root
 #
+# Changelog:
+#   1.0.3 - Fixed exit-141 (SIGPIPE) bug: the "Available PPDs" reference listing
+#           tripped `set -e`/`pipefail` when `head` closed the pipe, so the script
+#           aborted with 141 before reaching its intended `exit 5`. Pipeline is now
+#           guarded so callers get the correct exit code.
+#         - HP PPD resolution now also matches PostScript PPDs. PS-capable LaserJet
+#           Pro models (e.g. M402dn) don't ship a free hpcups PPD but print correctly
+#           on their native PostScript PPD. install_hp_driver now installs
+#           printer-driver-postscript-hp, and the HP generic fallback is a PostScript
+#           PPD instead of an inkjet (hp-deskjet) PPD.
+#         - Model-token regex now captures lowercase suffixes (e.g. "M402dn" -> "M402dn").
+#   1.0.2 - Prior release.
+#
 set -euo pipefail
 
-VERSION="1.0.2"
+VERSION="1.0.3"
 
 # ---------- Config ----------
 LOG_FILE="/var/log/install-printer.log"
@@ -234,6 +247,11 @@ install_hp_driver() {
     info "Installing HPLIP for HP printers..."
     apt-get install -y -qq hplip hplip-data printer-driver-hpcups >>"$LOG_FILE" 2>&1 \
         || die "Failed to install hplip." 4
+    # Many LaserJet Pro models (e.g. M402dn) don't ship a free hpcups PPD but have
+    # native PostScript level 3 emulation. This package provides matching PS PPDs so
+    # resolve_ppd can find a model-specific, non-blank-page driver without hp-plugin.
+    apt-get install -y -qq printer-driver-postscript-hp >>"$LOG_FILE" 2>&1 \
+        || warn "printer-driver-postscript-hp unavailable; PostScript-only LaserJets may not resolve a PPD."
     info "HPLIP installed. Note: some LaserJet Pro / certain inkjets need 'hp-plugin' run interactively."
 }
 
@@ -269,7 +287,7 @@ resolve_ppd() {
     # Examples:
     #   "ST-M1000 Series" → ["ST-M1000", "M1000", "ST-M1000 Series", "ST"]
     #   "HL-L2350DW"      → ["HL-L2350DW", "L2350DW", "HL-L2350"]
-    #   "OfficeJet Pro 8025" → ["OfficeJet Pro 8025", "8025", "OfficeJet"]
+    #   "LaserJet M402dn" → ["LaserJet M402dn", "M402dn"]
     local -a tokens=()
 
     # The whole trimmed model, with "Series" stripped (CUPS PPDs sometimes don't include it)
@@ -283,18 +301,23 @@ resolve_ppd() {
     hyphenated="$(echo "$raw_model" | grep -oE '[A-Z]+-[A-Z0-9]+' | head -n1 || true)"
     [[ -n "$hyphenated" ]] && tokens+=("$hyphenated")
 
-    # Numeric-suffix part: M1000, L2350DW, 8025
+    # Numeric-suffix part: M1000, L2350DW, 8025, M402dn
+    # Trailing letters may be lowercase on some models (M402dn), so allow either case.
     local numeric
-    numeric="$(echo "$raw_model" | grep -oE '[A-Z]*[0-9]{3,}[A-Z]*' | head -n1 || true)"
+    numeric="$(echo "$raw_model" | grep -oE '[A-Za-z]*[0-9]{3,}[A-Za-z]*' | head -n1 || true)"
     [[ -n "$numeric" ]] && tokens+=("$numeric")
 
     info "PPD candidate tokens: ${tokens[*]:-<none>}"
 
-    # Vendor-specific search filters
+    # Vendor-specific search filters.
+    # For HP we match on the make ("hp") rather than a single driver family, so the
+    # search sees both hpcups and PostScript (postscript-hp) PPDs; preferred_driver
+    # keeps hpcups first when present (best for inkjets), then PS PPDs are picked up
+    # by the vendor-only pass below.
     local vendor_grep="" preferred_driver=""
     case "$vendor" in
         epson)   vendor_grep="epson";   preferred_driver="escpr2" ;;
-        hp)      vendor_grep="hpcups";  preferred_driver="" ;;
+        hp)      vendor_grep="hp";      preferred_driver="hpcups" ;;
         brother) vendor_grep="brother"; preferred_driver="brlaser" ;;
         *)       vendor_grep="$vendor"; preferred_driver="" ;;
     esac
@@ -326,7 +349,10 @@ resolve_ppd() {
     # Return the most-likely-to-work generic fallback and let the caller decide.
     case "$vendor" in
         hp)
-            ppd="drv:///hp/hpcups.drv/hp-deskjet.ppd"
+            # Prefer a real PostScript PPD: PS-capable LaserJets print correctly on it
+            # (an inkjet PPD like hp-deskjet would garble/blank a mono laser).
+            ppd="$(echo "$all_ppds" | grep -i "postscript" | grep -i "hp" | awk '{print $1}' | head -n1 || true)"
+            [[ -z "$ppd" ]] && ppd="drv:///sample.drv/generic.ppd"
             ;;
         brother)
             ppd="$(echo "$all_ppds" | grep -i "brlaser" | awk '{print $1}' | head -n1 || true)"
@@ -438,9 +464,14 @@ if [[ "$PPD_QUALITY" == "generic" ]]; then
         err "No model-specific PPD found for '$RAW_MODEL'."
         err "Refusing to install with a generic PPD because that often results in blank pages."
         err "Available ${DETECTED_VENDOR} PPDs (for reference):"
-        lpinfo -m 2>/dev/null | grep -i "$DETECTED_VENDOR" | head -n 30 | while IFS= read -r ln; do
-            err "  $ln"
-        done
+        # NOTE: `head` closes the pipe early, which sends SIGPIPE to the upstream
+        # grep. Under `set -e`/`pipefail` that made the whole script abort with 141
+        # *before* the `exit 5` below. Guard the pipeline so the intended exit code
+        # is preserved.
+        { lpinfo -m 2>/dev/null | grep -i "$DETECTED_VENDOR" | head -n 30 || true; } \
+            | while IFS= read -r ln; do
+                err "  $ln"
+            done
         err "Options:"
         err "  1) Install the vendor's model-specific PPD/driver and re-run."
         err "  2) Re-run with --allow-generic-ppd to accept the generic fallback anyway."
