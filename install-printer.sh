@@ -26,6 +26,10 @@
 #   6  must be run as root
 #
 # Changelog:
+#   1.0.4 - PPD token matching now emits BOTH the full model id (e.g. "M402dn") and
+#           the digit-core ("M402"). HP names family PPDs like "M402-M403", which the
+#           full id does not substring-match but the core does. Without this, a
+#           PostScript LaserJet with only a family-named PPD still failed to resolve.
 #   1.0.3 - Fixed exit-141 (SIGPIPE) bug: the "Available PPDs" reference listing
 #           tripped `set -e`/`pipefail` when `head` closed the pipe, so the script
 #           aborted with 141 before reaching its intended `exit 5`. Pipeline is now
@@ -35,12 +39,12 @@
 #           on their native PostScript PPD. install_hp_driver now installs
 #           printer-driver-postscript-hp, and the HP generic fallback is a PostScript
 #           PPD instead of an inkjet (hp-deskjet) PPD.
-#         - Model-token regex now captures lowercase suffixes (e.g. "M402dn" -> "M402dn").
+#         - Model-token regex now captures lowercase suffixes (e.g. "M402dn").
 #   1.0.2 - Prior release.
 #
 set -euo pipefail
 
-VERSION="1.0.3"
+VERSION="1.0.4"
 
 # ---------- Config ----------
 LOG_FILE="/var/log/install-printer.log"
@@ -287,7 +291,7 @@ resolve_ppd() {
     # Examples:
     #   "ST-M1000 Series" → ["ST-M1000", "M1000", "ST-M1000 Series", "ST"]
     #   "HL-L2350DW"      → ["HL-L2350DW", "L2350DW", "HL-L2350"]
-    #   "LaserJet M402dn" → ["LaserJet M402dn", "M402dn"]
+    #   "LaserJet M402dn" → ["LaserJet M402dn", "M402dn", "M402"]
     local -a tokens=()
 
     # The whole trimmed model, with "Series" stripped (CUPS PPDs sometimes don't include it)
@@ -301,11 +305,17 @@ resolve_ppd() {
     hyphenated="$(echo "$raw_model" | grep -oE '[A-Z]+-[A-Z0-9]+' | head -n1 || true)"
     [[ -n "$hyphenated" ]] && tokens+=("$hyphenated")
 
-    # Numeric-suffix part: M1000, L2350DW, 8025, M402dn
+    # Numeric model identifier WITH any suffix: M1000, L2350DW, 8025, M402dn.
     # Trailing letters may be lowercase on some models (M402dn), so allow either case.
-    local numeric
-    numeric="$(echo "$raw_model" | grep -oE '[A-Za-z]*[0-9]{3,}[A-Za-z]*' | head -n1 || true)"
-    [[ -n "$numeric" ]] && tokens+=("$numeric")
+    local numeric_full numeric_core
+    numeric_full="$(echo "$raw_model" | grep -oE '[A-Za-z]*[0-9]{3,}[A-Za-z]*' | head -n1 || true)"
+    [[ -n "$numeric_full" ]] && tokens+=("$numeric_full")
+
+    # Digit-core only: M402, L2350, 8025. HP (and others) name family PPDs like
+    # "M402-M403", which the full id "M402dn" will NOT substring-match but the core
+    # "M402" will. Add it as a less-specific fallback after the full id.
+    numeric_core="$(echo "$raw_model" | grep -oE '[A-Za-z]*[0-9]{3,}' | head -n1 || true)"
+    [[ -n "$numeric_core" && "$numeric_core" != "$numeric_full" ]] && tokens+=("$numeric_core")
 
     info "PPD candidate tokens: ${tokens[*]:-<none>}"
 
