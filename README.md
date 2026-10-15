@@ -7,6 +7,7 @@ Scripts and tooling for [openthinclient](https://openthinclient.com/)-based thin
 | Script | Purpose |
 | --- | --- |
 | [`install-printer.sh`](#install-printersh) | Multi-vendor USB printer installer for CUPS (Epson, HP, Brother) |
+| [`build-bundle.sh`](#build-bundlesh) | Builds the offline driver bundle and stages it on an openthinclient Manager |
 
 ---
 
@@ -42,12 +43,16 @@ sudo ./install-printer.sh --name Shop-Floor-Printer --no-default
 # Force reinstall (skip the early-exit guard)
 sudo ./install-printer.sh --force
 
+# Ignore the offline bundle and install from apt / vendor downloads
+sudo ./install-printer.sh --online
+
 # Remove a queue
 sudo ./install-printer.sh --uninstall Epson-Printer
 ```
 
 ### Behavior
 
+- **Offline by default on the shop floor.** If `/opt/mtm-printer/debs/*.deb` exists (delivered by the openthinclient custom folder, see [build-bundle.sh](#build-bundlesh)), CUPS and every vendor driver are installed from there with `dpkg` and **no network is used**: no `apt-get`, no Epson download, no GitHub fetch. `--online` forces the old apt path; `--bundle-dir <dir>` points at another bundle.
 - **Idempotent.** If a printer queue created by this script (`Epson-Printer`, `HP-Printer`, `Brother-Printer`, `USB-Printer`) already exists, the script exits 0 without reinstalling. Use `--force` to override.
 - **Logged.** All output is written to `/var/log/install-printer.log` with timestamps. Always check this first when troubleshooting.
 - **Default queue names** per vendor: `Epson-Printer`, `HP-Printer`, `Brother-Printer`. Override with `--name`.
@@ -67,6 +72,28 @@ sudo ./install-printer.sh --uninstall Epson-Printer
 
 ---
 
+## build-bundle.sh
+
+Builds `mtm-printer.tar.gz`, the offline bundle that makes `install-printer.sh` work with no network. Run it **on an openthinclient Manager server** as the `openthinclient` user:
+
+```bash
+sudo apt-get install -y squashfs-tools wget
+./build-bundle.sh            # build and stage into <Manager-Home>/nfs/root/custom/packages/
+./build-bundle.sh --no-stage # build only
+```
+
+What it does:
+
+1. Finds the newest `base_<ver>/base.sfs` the Manager serves and pulls the **thin client's** `dpkg` status, apt sources and archive keys out of it.
+2. Runs `apt-get install --download-only` against that package database (not the server's own) to get the exact Debian 13 dependency closure for `cups`, `cups-filters`, `printer-driver-escpr`, `hplip`, `printer-driver-hpcups`, `printer-driver-postscript-hp`, `printer-driver-brlaser`, `printer-driver-ptouch`, `printer-driver-foo2zjs`.
+3. Downloads the Epson ESC/P-R 2 vendor `.deb`.
+4. Packs `opt/mtm-printer/install-printer.sh`, `opt/mtm-printer/debs/*.deb` and a `MANIFEST` into a root-owned `tar.gz` (about 18 MB).
+5. Installs it as `<Manager-Home>/nfs/root/custom/packages/mtm-printer.tar.gz`.
+
+How it reaches the units: the thin client initrd extracts every tar in `custom/packages/` into the root filesystem at boot, before Debian starts (`mountcustom` in `init_functions`). On localboot units the updater (`Localboot > Activate client update = Yes`) rsyncs `custom/` from the Manager every 10 minutes and the new content is applied on the unit's next boot. Each Manager has its own custom folder, so copy the tar to every server (or run the build on each).
+
+Re-run after a **base** package update on the Manager, because the closure is computed against the client package database in that image. Loose `.deb` files in `custom/packages/` are ignored by the client; only tar archives are processed.
+
 ## Deployment
 
 ### openthinclient — Command line application
@@ -78,7 +105,15 @@ Create a Command line application in the openthinclient management console with:
 - **Hide icon:** Yes
 - **Elevated privileges:** Allow sudo
 
-**Command line field** (recommended — pinned to a release tag):
+**Command line field** (offline bundle, recommended; requires `mtm-printer.tar.gz` staged on that Manager):
+
+```bash
+sudo /opt/mtm-printer/install-printer.sh
+```
+
+The script is part of the bundle, so a new script version ships by rebuilding and restaging the bundle, not by changing this field.
+
+**Command line field** (online fallback, pinned to a release tag; needs WiFi up and internet egress at autostart time):
 
 ```bash
 sh -c 'set -e; TMP=$(mktemp); curl -fsSL https://raw.githubusercontent.com/Manitowoc-Tool-and-Machining/openthinclient-scripts/v1.0.0/install-printer.sh -o "$TMP" && chmod +x "$TMP" && sudo "$TMP"; rc=$?; rm -f "$TMP"; exit $rc'
@@ -152,6 +187,11 @@ This repo uses [Semantic Versioning](https://semver.org/) for tagged releases. P
 
 | Version | Notes |
 | --- | --- |
+| 1.1.0 | Offline mode: installs from `/opt/mtm-printer/debs` with `dpkg` when present; `--online`, `--bundle-dir`. New `build-bundle.sh`. Fixes the localboot autostart race (script ran before WiFi associated). |
+| 1.0.4 | PPD token matching emits the digit-core model id (M402) so family-named PostScript PPDs resolve. |
+| 1.0.3 | SIGPIPE exit-141 fix; PostScript LaserJet PPD support (`printer-driver-postscript-hp`). |
+| 1.0.2 | Better PPD model matching; refuse a generic PPD instead of silently falling back. |
+| 1.0.1 | Vendor detection parses the USB URI directly. |
 | 1.0.0 | Initial release. Multi-vendor support (Epson, HP, Brother), early-exit guard, structured logging, CLI args. |
 
 ---

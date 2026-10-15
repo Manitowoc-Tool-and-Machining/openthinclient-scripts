@@ -15,6 +15,14 @@
 #   sudo ./install-printer.sh --uninstall <name>    # remove a queue
 #   sudo ./install-printer.sh --force               # ignore early-exit guard, reinstall
 #   sudo ./install-printer.sh --allow-generic-ppd   # accept generic-fallback PPD instead of failing
+#   sudo ./install-printer.sh --online              # ignore the offline bundle, use apt + downloads
+#
+# Offline bundle (openthinclient localboot units):
+#   If /opt/mtm-printer/debs/*.deb exists (delivered via the Manager's
+#   custom/packages/mtm-printer.tar.gz, built by build-bundle.sh), everything is
+#   installed from there with dpkg and NO network is used. This is the default
+#   on the shop floor, where the script autostarts before WiFi is up and
+#   internet egress is being removed. Override with --online or --bundle-dir.
 #
 # Exit codes:
 #   0  success (or already installed and --force not set)
@@ -26,6 +34,11 @@
 #   6  must be run as root
 #
 # Changelog:
+#   1.1.0 - Offline mode. When the bundle dir (/opt/mtm-printer/debs) holds .debs,
+#           base packages and all vendor drivers are installed with dpkg from it;
+#           apt-get, the Epson download and the GitHub fetch are not used at all.
+#           Fixes the autostart race on localboot units (script ran before WiFi
+#           was associated, so curl/apt failed). --online forces the old path.
 #   1.0.4 - PPD token matching now emits BOTH the full model id (e.g. "M402dn") and
 #           the digit-core ("M402"). HP names family PPDs like "M402-M403", which the
 #           full id does not substring-match but the core does. Without this, a
@@ -44,13 +57,18 @@
 #
 set -euo pipefail
 
-VERSION="1.0.4"
+VERSION="1.1.0"
 
 # ---------- Config ----------
 LOG_FILE="/var/log/install-printer.log"
 EPSON_DEB_URL="https://download3.ebz.epson.net/dsc/f/03/00/16/90/96/951574ae91f5cdc717c8bdce53b1fac5d2dc8a0a/epson-inkjet-printer-escpr2_1.2.31-1_amd64.deb"
 TMP_DIR="$(mktemp -d -t printer-install-XXXXXX)"
 trap 'rm -rf "$TMP_DIR"' EXIT
+
+# Offline bundle: .debs pre-staged on the client by build-bundle.sh via the
+# openthinclient custom folder. OFFLINE is decided after arg parsing.
+BUNDLE_DIR="${BUNDLE_DIR:-/opt/mtm-printer/debs}"
+OFFLINE=0
 
 # Queue names this script creates — used by the early-exit guard
 KNOWN_QUEUE_NAMES=("Epson-Printer" "HP-Printer" "Brother-Printer" "USB-Printer")
@@ -64,6 +82,7 @@ UNINSTALL=""
 SET_DEFAULT=1
 FORCE=0
 ALLOW_GENERIC=0
+ONLINE=0
 
 # ---------- Helpers ----------
 log() {
@@ -107,6 +126,8 @@ while [[ $# -gt 0 ]]; do
         --no-default)         SET_DEFAULT=0; shift ;;
         --force)              FORCE=1; shift ;;
         --allow-generic-ppd)  ALLOW_GENERIC=1; shift ;;
+        --online)             ONLINE=1; shift ;;
+        --bundle-dir)         BUNDLE_DIR="$2"; shift 2 ;;
         -h|--help)            usage ;;
         *) die "Unknown argument: $1" 1 ;;
     esac
@@ -116,6 +137,14 @@ require_root
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
 info "===== install-printer.sh v$VERSION start ====="
+
+if [[ "$ONLINE" -eq 0 ]] && compgen -G "$BUNDLE_DIR/*.deb" >/dev/null; then
+    OFFLINE=1
+    info "Offline bundle found in $BUNDLE_DIR ($(ls "$BUNDLE_DIR"/*.deb | wc -l) debs); no network will be used."
+    [[ -f "$BUNDLE_DIR/../MANIFEST" ]] && sed 's/^/    /' "$BUNDLE_DIR/../MANIFEST" >>"$LOG_FILE"
+else
+    info "No offline bundle (or --online given); using apt and vendor downloads."
+fi
 
 # ---------- Uninstall path ----------
 if [[ -n "$UNINSTALL" ]]; then
@@ -149,9 +178,36 @@ if [[ "$LIST_ONLY" -eq 0 && "$FORCE" -eq 0 ]]; then
 fi
 
 # ---------- Base packages ----------
-ensure_base_packages() {
-    info "Updating apt and installing base CUPS packages..."
+# Offline: one dpkg pass over the whole bundle. dpkg orders the set itself; a
+# second --configure -a pass catches anything left unconfigured. The set was
+# resolved against the client's own package database by build-bundle.sh, so no
+# dependency outside the bundle should be missing. Skipped when the markers
+# (cups daemon + all three vendor stacks) are already installed.
+install_bundle() {
     export DEBIAN_FRONTEND=noninteractive
+    if dpkg -s cups-daemon printer-driver-escpr epson-inkjet-printer-escpr2 hplip printer-driver-brlaser >/dev/null 2>&1; then
+        info "Bundle packages already installed; skipping dpkg."
+        return 0
+    fi
+    info "Installing $(ls "$BUNDLE_DIR"/*.deb | wc -l) packages from the offline bundle with dpkg..."
+    if ! dpkg -i --force-confold "$BUNDLE_DIR"/*.deb >>"$LOG_FILE" 2>&1; then
+        warn "dpkg -i reported errors; running dpkg --configure -a"
+        dpkg --configure -a >>"$LOG_FILE" 2>&1 || true
+    fi
+    dpkg -s cups-daemon >/dev/null 2>&1 || die "cups-daemon is not installed after the bundle pass; see $LOG_FILE" 4
+    info "Bundle installed."
+}
+
+ensure_base_packages() {
+    export DEBIAN_FRONTEND=noninteractive
+    if [[ "$OFFLINE" -eq 1 ]]; then
+        install_bundle
+        systemctl enable --now cups >>"$LOG_FILE" 2>&1 || warn "Could not enable cups service (may already be running)."
+        # cupsd needs a moment before lpinfo can enumerate USB backends
+        for _ in $(seq 1 20); do lpstat -r 2>/dev/null | grep -q "is running" && break; sleep 0.5; done
+        return 0
+    fi
+    info "Updating apt and installing base CUPS packages..."
     apt-get update -qq
     apt-get install -y -qq \
         cups \
@@ -231,6 +287,14 @@ list_printers() {
 
 install_epson_driver() {
     info "Installing Epson ESC/PR2 driver..."
+    if [[ "$OFFLINE" -eq 1 ]]; then
+        if dpkg -s printer-driver-escpr epson-inkjet-printer-escpr2 >/dev/null 2>&1; then
+            info "Epson drivers present from bundle."
+        else
+            die "Epson driver packages missing from bundle." 4
+        fi
+        return 0
+    fi
     if apt-cache show printer-driver-escpr >/dev/null 2>&1; then
         apt-get install -y -qq printer-driver-escpr >>"$LOG_FILE" 2>&1 || warn "printer-driver-escpr install failed; falling back to vendor .deb"
     fi
@@ -249,6 +313,15 @@ install_epson_driver() {
 
 install_hp_driver() {
     info "Installing HPLIP for HP printers..."
+    if [[ "$OFFLINE" -eq 1 ]]; then
+        if dpkg -s hplip printer-driver-hpcups >/dev/null 2>&1; then
+            info "HP drivers present from bundle."
+        else
+            die "HP driver packages missing from bundle." 4
+        fi
+        dpkg -s printer-driver-postscript-hp >/dev/null 2>&1 || warn "printer-driver-postscript-hp not in bundle; PostScript-only LaserJets may not resolve a PPD."
+        return 0
+    fi
     apt-get install -y -qq hplip hplip-data printer-driver-hpcups >>"$LOG_FILE" 2>&1 \
         || die "Failed to install hplip." 4
     # Many LaserJet Pro models (e.g. M402dn) don't ship a free hpcups PPD but have
@@ -261,11 +334,19 @@ install_hp_driver() {
 
 install_brother_driver() {
     info "Configuring Brother printer support..."
-    apt-get install -y -qq \
-        printer-driver-brlaser \
-        printer-driver-ptouch \
-        printer-driver-foo2zjs \
-        >>"$LOG_FILE" 2>&1 || warn "One or more Brother driver packages failed; continuing."
+    if [[ "$OFFLINE" -eq 1 ]]; then
+        if dpkg -s printer-driver-brlaser printer-driver-ptouch printer-driver-foo2zjs >/dev/null 2>&1; then
+            info "Brother drivers present from bundle."
+        else
+            warn "One or more Brother driver packages missing from bundle; continuing."
+        fi
+    else
+        apt-get install -y -qq \
+            printer-driver-brlaser \
+            printer-driver-ptouch \
+            printer-driver-foo2zjs \
+            >>"$LOG_FILE" 2>&1 || warn "One or more Brother driver packages failed; continuing."
+    fi
 
     if [[ -n "$MODEL" ]]; then
         info "Brother model specified: $MODEL"
